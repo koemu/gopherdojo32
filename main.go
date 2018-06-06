@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 
 	"golang.org/x/sync/errgroup"
@@ -73,7 +74,19 @@ func GetSize(uri string) (int64, error) {
 // Download is paralell download file
 func Download(fileInfo FileInfo) error {
 	procPerSize := fileInfo.FileSize / fileInfo.Conccurency
-	errG, ctx := errgroup.WithContext(context.TODO())
+	errG, ctx := errgroup.WithContext(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		select {
+		case <-c:
+			cancel()
+			errG.Go(func() error { return errors.New("処理を中断しました") })
+		}
+	}()
 
 	for i := int64(0); i < conccurency; i++ {
 		index := i // for concurrent request
@@ -82,16 +95,16 @@ func Download(fileInfo FileInfo) error {
 			if errReq != nil {
 				return errReq
 			}
-			req.WithContext(ctx)
 
 			endSize := (index+1)*procPerSize - 1
 			if index+1 == conccurency {
 				endSize = fileInfo.FileSize
 			}
-			fmt.Printf("bytes=%d-%d\n", index*procPerSize, endSize)
 			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", index*procPerSize, endSize))
+			req.WithContext(ctx)
 			res, errRes := http.DefaultClient.Do(req)
 			if errRes != nil {
+				fmt.Println("リクエストがキャンセルされました")
 				return errRes
 			}
 			defer res.Body.Close()
@@ -103,9 +116,38 @@ func Download(fileInfo FileInfo) error {
 			}
 			defer output.Close()
 
-			_, errOutput := io.Copy(output, res.Body)
-			if errOutput != nil {
-				return errOutput
+			scanner := bufio.NewScanner(res.Body)
+			scanner.Split(bufio.ScanBytes)
+
+			IntterptedScanner := func(ctx context.Context) <-chan int {
+				status := make(chan int)
+				scan := 0
+				if scanner.Scan() {
+					scan = 1
+				}
+				go func() {
+					for {
+						select {
+						case <-ctx.Done():
+							status <- -1
+						case status <- scan:
+						}
+					}
+				}()
+				return status
+			}
+			for {
+				status := <-IntterptedScanner(ctx)
+				if status < 0 {
+					return errors.New("処理を中断しました")
+				}
+				if status == 0 {
+					break
+				}
+				_, errOutput := output.Write(scanner.Bytes())
+				if errOutput != nil {
+					return errOutput
+				}
 			}
 
 			return nil
@@ -113,7 +155,6 @@ func Download(fileInfo FileInfo) error {
 	}
 
 	if err := errG.Wait(); err != nil {
-		fmt.Println("エラーが発生しました")
 		files, _ := filepath.Glob(fmt.Sprintf("%s.*", fileInfo.Filename))
 		for _, filename := range files {
 			os.Remove(filename)
